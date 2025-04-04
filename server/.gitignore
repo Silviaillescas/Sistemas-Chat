@@ -1,0 +1,37 @@
+
+### **.gitignore**
+
+```gitignore
+# Archivos temporales de compilación
+*.o
+*.out
+*.a
+*.lo
+*.la
+*.dll
+*.so
+*.dylib
+
+# Archivos de compilación específicos
+server
+*.c~   # Archivos de respaldo creados por el editor
+*.swp  # Archivos de intercambio de vim
+
+# Directorios de dependencias
+node_modules/
+
+# Archivos de logs
+*.log
+
+# Archivos de configuración del sistema operativo
+.DS_Store
+Thumbs.db
+
+# Archivos de compilación de IDEs (si es necesario)
+.vscode/
+.idea/
+*.iml
+
+# Archivos de configuración de herramientas de contenedores (si aplica)
+*.dockerfile
+docker-compose.yml

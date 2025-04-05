@@ -1,227 +1,336 @@
 #include <libwebsockets.h>
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <thread>
-#include <mutex>
-#include <vector>
+#include <openssl/sha.h>
 #include <unordered_map>
 #include <set>
 #include <map>
-#include <cstring>
-#include <cstdlib>
-#include <ctime>
-#include <openssl/sha.h>
+#include <vector>
+#include <mutex>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
 
+using namespace std;
+using namespace chrono;
+
+// Estructuras y constantes
 struct ClientInfo {
-    struct lws *wsi = nullptr;  // WebSocket instance
-    uint8_t status = 0;  // Estado del usuario
-    std::chrono::steady_clock::time_point ultimaActividad;
-
-    ClientInfo() : wsi(nullptr), status(0), ultimaActividad(std::chrono::steady_clock::now()) {}
-    ClientInfo(struct lws *w, uint8_t st) : wsi(w), status(st), ultimaActividad(std::chrono::steady_clock::now()) {}
+    string username;
+    uint8_t status;  // 1=ACTIVO, 2=OCUPADO, 3=INACTIVO, 0=DESCONECTADO
+    steady_clock::time_point last_activity;
+    vector<uint8_t> write_buffer;
+    mutex buffer_mutex;
+    struct lws *wsi;
+    
+    ClientInfo() : status(1) {}  // Inicialización C++98 compatible
 };
 
-std::unordered_map<std::string, ClientInfo> clientes;  // Mapa de clientes conectados
-std::set<std::string> todosUsuarios;  // Todos los usuarios conectados
-std::map<std::string, std::vector<std::string>> historial;  // Historial de mensajes por usuario
-std::vector<std::string> historialGlobal;  // Historial de mensajes global
-std::mutex usersMutex;  // Mutex para proteger el acceso a los datos
-bool serverRunning = true;
+mutex clients_mutex;
+unordered_map<string, ClientInfo> clients;
+map<string, vector<string> > message_history;  // Espacio entre > >
+vector<string> global_history;
+set<string> all_users;
 
-const std::string WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";  // GUID para WebSocket
+const int PORT = 9000;
+const int INACTIVITY_TIMEOUT = 60;
 
-// Funciones necesarias
-std::string base64Encode(const std::vector<unsigned char>& data);
-std::vector<unsigned char> base64Decode(const std::string& input);
-bool enviarFrame(struct lws *wsi, const std::vector<char>& data);
-void registrarLog(const std::string& evento);
+// Prototipos
+void broadcast_status_change(const string& username, uint8_t status);
+void send_error(struct lws *wsi, uint8_t error_code);
+void handle_message(struct lws *wsi, ClientInfo* client, unsigned char* data, size_t len);
+void check_inactivity();
+void update_user_activity(ClientInfo* client);
 
-// Función para codificar en Base64
-std::string base64Encode(const std::vector<unsigned char>& data) {
-    static const char* base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string encoded;
-    encoded.reserve(((data.size() + 2) / 3) * 4);
-    unsigned int val = 0;
-    int valb = -6;
-    for (unsigned char c : data) {
-        val = (val << 8) + c;
-        valb += 8;
-        while (valb >= 0) {
-            encoded.push_back(base64Chars[(val >> valb) & 0x3F]);
-            valb -= 6;
-        }
-    }
-    if (valb > -6) {
-        encoded.push_back(base64Chars[((val << 8) >> (valb + 8)) & 0x3F]);
-    }
-    while (encoded.size() % 4) {
-        encoded.push_back('=');
-    }
-    return encoded;
-}
+// Callbacks LWS
+static int callback_protocol(struct lws *wsi, enum lws_callback_reasons reason, 
+                            void *user, void *in, size_t len) {
+    ClientInfo* client = (ClientInfo*)user;
 
-// Función para decodificar Base64
-std::vector<unsigned char> base64Decode(const std::string& input) {
-    static const std::string base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::vector<int> index(256, -1);
-    for (int i = 0; i < 64; ++i) {
-        index[base64Chars[i]] = i;
-    }
-
-    std::vector<unsigned char> output;
-    int val = 0;
-    int valb = -8;
-    for (unsigned char c : input) {
-        if (index[c] == -1) break;
-        val = (val << 6) + index[c];
-        valb += 6;
-        if (valb >= 0) {
-            output.push_back(char((val >> valb) & 0xFF));
-            valb -= 8;
-        }
-    }
-    return output;
-}
-
-// Función para enviar un frame WebSocket a un cliente
-bool enviarFrame(struct lws *wsi, const std::vector<char>& data) {
-    unsigned char *buffer = new unsigned char[LWS_PRE + data.size()];
-    memcpy(buffer + LWS_PRE, data.data(), data.size());
-
-    int bytesWritten = lws_write(wsi, buffer + LWS_PRE, data.size(), LWS_WRITE_BINARY);
-    delete[] buffer;
-
-    return bytesWritten == data.size();
-}
-
-// Manejador de eventos de WebSocket
-static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
     switch (reason) {
         case LWS_CALLBACK_ESTABLISHED: {
-            // El cliente se conecta
-            std::cout << "Nuevo cliente conectado." << std::endl;
+            char uri[256];
+            lws_hdr_copy(wsi, uri, sizeof(uri), WSI_TOKEN_GET_URI);
+            string query(uri);
+            size_t name_pos = query.find("?name=");
+
+            if (name_pos == string::npos || query.size() <= name_pos + 6) {
+                lws_close_reason(wsi, LWS_CLOSE_STATUS_PROTOCOL_ERR, NULL, 0);
+                return -1;
+            }
+
+            string username = query.substr(name_pos + 6);
+            if (username.empty() || username == "~" || username.size() > 255) {
+                lws_close_reason(wsi, LWS_CLOSE_STATUS_POLICY_VIOLATION, NULL, 0);
+                return -1;
+            }
+
+            {
+            lock_guard<mutex> lock(clients_mutex);
+            
+            if (clients.count(username) || all_users.count(username)) {
+                lws_close_reason(wsi, LWS_CLOSE_STATUS_POLICY_VIOLATION, NULL, 0);
+                return -1;
+            }
+
+            all_users.insert(username);
+            clients.emplace(std::piecewise_construct,
+                            std::forward_as_tuple(username),
+                            std::make_tuple());
+            
+            ClientInfo& new_client = clients[username];
+            new_client.username = username;
+            new_client.wsi = wsi;
+            client = &new_client;
+        }
+
+            broadcast_status_change(username, 53);
             break;
         }
 
         case LWS_CALLBACK_RECEIVE: {
-            unsigned char *data = (unsigned char*)in;
-            uint8_t messagetype = data[0];
+            if (!client) return -1;
+            update_user_activity(client);
+            handle_message(wsi, client, (unsigned char*)in, len);
+            break;
+        }
 
-            switch (messagetype) {
-                case 1: {
-                    // Listar usuarios
-                    std::cout << "Listando usuarios conectados." << std::endl;
-                    break;
-                }
-                case 2: {
-                    // Obtener información de usuario
-                    std::cout << "Obteniendo información de un usuario." << std::endl;
-                    break;
-                }
-                case 3: {
-                    // Cambiar estado
-                    std::cout << "Cambio de estado." << std::endl;
-                    break;
-                }
-                case 4: {
-                    // Enviar mensaje privado
-                    std::cout << "Enviando mensaje privado." << std::endl;
-                    break;
-                }
-                default:
-                    break;
+        case LWS_CALLBACK_SERVER_WRITEABLE: {
+            if (!client) return -1;
+            
+            lock_guard<mutex> lock(client->buffer_mutex);
+            if (!client->write_buffer.empty()) {
+                lws_write(wsi, client->write_buffer.data(), 
+                         client->write_buffer.size(), LWS_WRITE_BINARY);
+                client->write_buffer.clear();
             }
             break;
         }
 
         case LWS_CALLBACK_CLOSED: {
-            // El cliente desconecta
-            std::cout << "Conexión cerrada." << std::endl;
+            if (!client) return 0;
+            
+            {
+                lock_guard<mutex> lock(clients_mutex);
+                client->status = 0;
+                broadcast_status_change(client->username, 0);
+                clients.erase(client->username);
+            }
             break;
         }
 
         default:
             break;
     }
-
     return 0;
 }
 
-static struct lws_protocols protocols[] = {
-    { "ws-protocol", ws_callback, 0, 1024 },  // Protocolo WebSocket
-    { NULL, NULL, 0, 0 }
-};
+void handle_message(struct lws *wsi, ClientInfo* client, unsigned char* data, size_t len) {
+    if (len < 1) return;
+    uint8_t msg_type = data[0];
 
-// Función para gestionar los mensajes privados
-void enviarMensajePrivado(const std::string& destinatario, const std::string& mensaje) {
-    std::lock_guard<std::mutex> lock(usersMutex);
-    auto it = clientes.find(destinatario);
-    if (it != clientes.end()) {
-        std::vector<char> frame;
-        frame.push_back(55);  // Código para mensaje privado
-        frame.push_back(destinatario.size());
-        frame.insert(frame.end(), destinatario.begin(), destinatario.end());
-        frame.push_back(mensaje.size());
-        frame.insert(frame.end(), mensaje.begin(), mensaje.end());
-        enviarFrame(it->second.wsi, frame);
-        std::cout << "Mensaje privado enviado a " << destinatario << ": " << mensaje << std::endl;
-    } else {
-        std::cout << "Error: El destinatario " << destinatario << " no está conectado." << std::endl;
+    switch (msg_type) {
+        case 1: { // Listar usuarios
+            vector<uint8_t> response;
+            response.push_back(51);
+            response.push_back(clients.size());
+            
+            lock_guard<mutex> lock(clients_mutex);
+            for (unordered_map<string, ClientInfo>::iterator it = clients.begin(); it != clients.end(); ++it) {
+                response.push_back(it->first.size());
+                response.insert(response.end(), it->first.begin(), it->first.end());
+                response.push_back(it->second.status);
+            }
+
+            lock_guard<mutex> buf_lock(client->buffer_mutex);
+            client->write_buffer = response;
+            lws_callback_on_writable(wsi);
+            break;
+        }
+
+        case 3: { // Cambiar estado
+            if (len < 2 || data[1] < 1 || data[1] > 3) {
+                send_error(wsi, 2);
+                return;
+            }
+
+            {
+                lock_guard<mutex> lock(clients_mutex);
+                client->status = data[1];
+                broadcast_status_change(client->username, data[1]);
+            }
+            break;
+        }
+
+        case 4: { // Enviar mensaje
+            if (len < 4) {
+                send_error(wsi, 3);
+                return;
+            }
+
+            uint8_t dest_len = data[1];
+            string dest((char*)data + 2, dest_len);
+            uint8_t msg_len = data[2 + dest_len];
+            string message((char*)data + 3 + dest_len, msg_len);
+
+            if (message.empty()) {
+                send_error(wsi, 3);
+                return;
+            }
+
+            vector<uint8_t> response;
+            response.push_back(55);
+            response.push_back(client->username.size());
+            response.insert(response.end(), client->username.begin(), client->username.end());
+            response.push_back(message.size());
+            response.insert(response.end(), message.begin(), message.end());
+
+            if (dest == "~") {
+                global_history.push_back(client->username + ": " + message);
+                
+                lock_guard<mutex> lock(clients_mutex);
+                for (unordered_map<string, ClientInfo>::iterator it = clients.begin(); it != clients.end(); ++it) {
+                    lock_guard<mutex> buf_lock(it->second.buffer_mutex);
+                    it->second.write_buffer = response;
+                    lws_callback_on_writable(it->second.wsi);
+                }
+            } else {
+                lock_guard<mutex> lock(clients_mutex);
+                unordered_map<string, ClientInfo>::iterator it = clients.find(dest);
+                if (it == clients.end() || it->second.status == 0) {
+                    send_error(wsi, 4);
+                    return;
+                }
+
+                message_history[dest].push_back(client->username + ": " + message);
+                
+                lock_guard<mutex> buf_lock(it->second.buffer_mutex);
+                it->second.write_buffer = response;
+                lws_callback_on_writable(it->second.wsi);
+            }
+            break;
+        }
+
+        case 5: { // Obtener historial
+            if (len < 2) return;
+            uint8_t chat_len = data[1];
+            string chat((char*)data + 2, chat_len);
+
+            vector<uint8_t> response;
+            response.push_back(56);
+            vector<string>* history = NULL;
+
+            if (chat == "~") history = &global_history;
+            else history = &message_history[chat];
+
+            response.push_back(history->size());
+            for (vector<string>::iterator it = history->begin(); it != history->end(); ++it) {
+                response.push_back(it->size());
+                response.insert(response.end(), it->begin(), it->end());
+            }
+
+            lock_guard<mutex> lock(client->buffer_mutex);
+            client->write_buffer = response;
+            lws_callback_on_writable(wsi);
+            break;
+        }
+
+        default:
+            send_error(wsi, 1);
+            break;
     }
 }
 
-// Función para cambiar el estado de un usuario
-void cambiarEstado(const std::string& nombreUsuario, uint8_t nuevoEstado) {
-    std::lock_guard<std::mutex> lock(usersMutex);
-    auto it = clientes.find(nombreUsuario);
-    if (it != clientes.end()) {
-        it->second.status = nuevoEstado;
-        std::cout << nombreUsuario << " ha cambiado su estado a " << nuevoEstado << std::endl;
+void broadcast_status_change(const string& username, uint8_t status) {
+    vector<uint8_t> msg;
+    msg.push_back(54);
+    msg.push_back(username.size());
+    msg.insert(msg.end(), username.begin(), username.end());
+    msg.push_back(status);
 
-        // Notificar a todos los usuarios sobre el cambio de estado
-        std::vector<char> notif;
-        notif.push_back(54);  // Código para cambio de estado
-        notif.push_back(nombreUsuario.size());
-        notif.insert(notif.end(), nombreUsuario.begin(), nombreUsuario.end());
-        notif.push_back(nuevoEstado);
+    lock_guard<mutex> lock(clients_mutex);
+    for (unordered_map<string, ClientInfo>::iterator it = clients.begin(); it != clients.end(); ++it) {
+        lock_guard<mutex> buf_lock(it->second.buffer_mutex);
+        it->second.write_buffer = msg;
+        lws_callback_on_writable(it->second.wsi);
+    }
+}
 
-        // Enviar la notificación a todos los usuarios
-        for (auto& [_, cliente] : clientes) {
-            enviarFrame(cliente.wsi, notif);
+void send_error(struct lws *wsi, uint8_t error_code) {
+    vector<uint8_t> err;
+    err.push_back(50);
+    err.push_back(error_code);
+    
+    ClientInfo* client = (ClientInfo*)lws_wsi_user(wsi);
+    if (!client) return;
+
+    lock_guard<mutex> lock(client->buffer_mutex);
+    client->write_buffer = err;
+    lws_callback_on_writable(wsi);
+}
+
+void check_inactivity() {
+    while (true) {
+        this_thread::sleep_for(seconds(10));
+        
+        auto now = steady_clock::now();
+        vector<string> inactive_users;
+
+        {
+            lock_guard<mutex> lock(clients_mutex);
+            for (unordered_map<string, ClientInfo>::iterator it = clients.begin(); it != clients.end(); ++it) {
+                duration<double> elapsed = now - it->second.last_activity;
+                if (elapsed.count() >= INACTIVITY_TIMEOUT && it->second.status != 3) {
+                    it->second.status = 3;
+                    inactive_users.push_back(it->first);
+                }
+            }
+        }
+
+        for (vector<string>::iterator it = inactive_users.begin(); it != inactive_users.end(); ++it) {
+            broadcast_status_change(*it, 3);
+            cout << "[Inactividad] " << *it << " marcado como INACTIVO\n";
         }
     }
 }
 
-// Función para iniciar múltiples hilos de servicio
-void startServer(int port) {
-    struct lws_context_creation_info info;
+void update_user_activity(ClientInfo* client) {
+    lock_guard<mutex> lock(clients_mutex);
+    client->last_activity = steady_clock::now();
+    
+    if (client->status == 3) {
+        client->status = 1;
+        broadcast_status_change(client->username, 1);
+    }
+}
+
+static struct lws_protocols protocols[] = {
+    {"chat-protocol", callback_protocol, sizeof(ClientInfo), 0},
+    {NULL, NULL, 0, 0}
+};
+
+int main() {
+    lws_context_creation_info info;
     memset(&info, 0, sizeof(info));
-
-    info.timeout_secs = 0;
-    info.port = port;
+    
+    info.port = PORT;
     info.protocols = protocols;
-    info.options = LWS_SERVER_OPTION_HTTP_HEADERS_SECURITY_BEST_PRACTICES_ENFORCE;
-    info.count_threads = 4;  // Usamos múltiples hilos
+    info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
-    struct lws_context *context = lws_create_context(&info);
+    lws_context* context = lws_create_context(&info);
     if (!context) {
-        std::cerr << "Error creando el contexto WebSocket." << std::endl;
-        return;
+        cerr << "Error al crear contexto LWS\n";
+        return 1;
     }
 
-    std::cout << "Servidor WebSocket iniciado en el puerto " << port << std::endl;
+    thread(check_inactivity).detach();
+    cout << "✅ Servidor iniciado en puerto " << PORT << endl;
 
-    // Aquí puedes usar múltiples hilos para procesar las conexiones
     while (true) {
-        lws_service(context, 0);  // Este ciclo procesa las conexiones WebSocket
+        lws_service(context, 50);
     }
 
     lws_context_destroy(context);
-}
-
-int main() {
-    const int PORT = 8080;  // Puerto en el que escuchará el servidor
-    startServer(PORT);
     return 0;
 }
